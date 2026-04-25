@@ -50,8 +50,7 @@ def _load_config() -> dict:
         "api_key": os.environ.get("MEM0_API_KEY", ""),
         "user_id": os.environ.get("MEM0_USER_ID", "hermes-user"),
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
-        "rerank": True,
-        "keyword_search": False,
+        "rerank": False,
     }
 
     config_path = get_hermes_home() / "mem0.json"
@@ -70,34 +69,40 @@ def _load_config() -> dict:
 # Tool schemas
 # ---------------------------------------------------------------------------
 
-PROFILE_SCHEMA = {
-    "name": "mem0_profile",
+LIST_SCHEMA = {
+    "name": "mem0_list",
     "description": (
-        "Retrieve all stored memories about the user — preferences, facts, "
-        "project context. Fast, no reranking. Use at conversation start."
+        "List all stored memories about the user. "
+        "Use at conversation start for full overview."
     ),
-    "parameters": {"type": "object", "properties": {}, "required": []},
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "page": {"type": "integer", "description": "Page number (default: 1)."},
+            "page_size": {"type": "integer", "description": "Results per page (default: 100, max: 200)."},
+        },
+        "required": [],
+    },
 }
 
 SEARCH_SCHEMA = {
     "name": "mem0_search",
     "description": (
-        "Search memories by meaning. Returns relevant facts ranked by similarity. "
-        "Set rerank=true for higher accuracy on important queries."
+        "Search memories by meaning. Returns relevant facts ranked by relevance."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
-            "rerank": {"type": "boolean", "description": "Enable reranking for precision (default: false)."},
+            "rerank": {"type": "boolean", "description": "Enable reranking for precision (default: false, adds latency)."},
             "top_k": {"type": "integer", "description": "Max results (default: 10, max: 50)."},
         },
         "required": ["query"],
     },
 }
 
-CONCLUDE_SCHEMA = {
-    "name": "mem0_conclude",
+ADD_SCHEMA = {
+    "name": "mem0_add",
     "description": (
         "Store a durable fact about the user. Stored verbatim (no LLM extraction). "
         "Use for explicit preferences, corrections, or decisions."
@@ -105,9 +110,34 @@ CONCLUDE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "conclusion": {"type": "string", "description": "The fact to store."},
+            "content": {"type": "string", "description": "The fact to store."},
         },
-        "required": ["conclusion"],
+        "required": ["content"],
+    },
+}
+
+UPDATE_SCHEMA = {
+    "name": "mem0_update",
+    "description": "Update an existing memory's text by its ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "Memory UUID to update."},
+            "text": {"type": "string", "description": "New text content."},
+        },
+        "required": ["memory_id", "text"],
+    },
+}
+
+DELETE_SCHEMA = {
+    "name": "mem0_delete",
+    "description": "Delete a memory by its ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "Memory UUID to delete."},
+        },
+        "required": ["memory_id"],
     },
 }
 
@@ -126,7 +156,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._api_key = ""
         self._user_id = "hermes-user"
         self._agent_id = "hermes"
-        self._rerank = True
+        self._rerank = False
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
@@ -162,7 +192,7 @@ class Mem0MemoryProvider(MemoryProvider):
             {"key": "api_key", "description": "Mem0 Platform API key", "secret": True, "required": True, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
             {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
             {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
-            {"key": "rerank", "description": "Enable reranking for recall", "default": "true", "choices": ["true", "false"]},
+            {"key": "rerank", "description": "Enable reranking for precision (adds latency)", "default": "false", "choices": ["true", "false"]},
         ]
 
     def _get_client(self):
@@ -207,7 +237,7 @@ class Mem0MemoryProvider(MemoryProvider):
         # fall back to config/env default for CLI (single-user) sessions.
         self._user_id = kwargs.get("user_id") or self._config.get("user_id", "hermes-user")
         self._agent_id = self._config.get("agent_id", "hermes")
-        self._rerank = self._config.get("rerank", True)
+        self._rerank = self._config.get("rerank", False)
 
     def _read_filters(self) -> Dict[str, Any]:
         """Filters for search/get_all — scoped to user only for cross-session recall."""
@@ -230,8 +260,8 @@ class Mem0MemoryProvider(MemoryProvider):
         return (
             "# Mem0 Memory\n"
             f"Active. User: {self._user_id}.\n"
-            "Use mem0_search to find memories, mem0_conclude to store facts, "
-            "mem0_profile for a full overview."
+            "Use mem0_search to find memories, mem0_add to store facts, "
+            "mem0_list for a full overview, mem0_update and mem0_delete to manage by ID."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -281,7 +311,7 @@ class Mem0MemoryProvider(MemoryProvider):
                     {"role": "user", "content": user_content},
                     {"role": "assistant", "content": assistant_content},
                 ]
-                client.add(messages, **self._write_filters())
+                client.add(messages, user_id=self._user_id, agent_id=self._agent_id)
                 self._record_success()
             except Exception as e:
                 self._record_failure()
@@ -295,7 +325,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._sync_thread.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
+        return [LIST_SCHEMA, SEARCH_SCHEMA, ADD_SCHEMA, UPDATE_SCHEMA, DELETE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if self._is_breaker_open():
@@ -308,55 +338,98 @@ class Mem0MemoryProvider(MemoryProvider):
         except Exception as e:
             return tool_error(str(e))
 
-        if tool_name == "mem0_profile":
+        if tool_name == "mem0_list":
+            page = int(args.get("page", 1))
+            page_size = min(int(args.get("page_size", 100)), 200)
             try:
-                memories = self._unwrap_results(client.get_all(filters=self._read_filters()))
+                response = client.get_all(
+                    filters=self._read_filters(), page=page, page_size=page_size,
+                )
                 self._record_success()
-                if not memories:
+                results = response.get("results", []) if isinstance(response, dict) else response
+                if not results:
                     return json.dumps({"result": "No memories stored yet."})
-                lines = [m.get("memory", "") for m in memories if m.get("memory")]
-                return json.dumps({"result": "\n".join(lines), "count": len(lines)})
+                items = [{"id": m.get("id"), "memory": m.get("memory", "")}
+                         for m in results]
+                return json.dumps({
+                    "results": items,
+                    "count": response.get("count", len(items)) if isinstance(response, dict) else len(items),
+                    "page": page, "page_size": page_size,
+                })
             except Exception as e:
                 self._record_failure()
-                return tool_error(f"Failed to fetch profile: {e}")
+                return tool_error(f"Failed to list memories: {e}")
 
         elif tool_name == "mem0_search":
             query = args.get("query", "")
             if not query:
                 return tool_error("Missing required parameter: query")
-            rerank = args.get("rerank", False)
+            rerank = args.get("rerank", self._rerank)
             top_k = min(int(args.get("top_k", 10)), 50)
             try:
-                results = self._unwrap_results(client.search(
-                    query=query,
-                    filters=self._read_filters(),
-                    rerank=rerank,
-                    top_k=top_k,
-                ))
+                response = client.search(
+                    query, filters=self._read_filters(), rerank=rerank, top_k=top_k,
+                )
                 self._record_success()
+                results = self._unwrap_results(response)
                 if not results:
                     return json.dumps({"result": "No relevant memories found."})
-                items = [{"memory": r.get("memory", ""), "score": r.get("score", 0)} for r in results]
+                items = [{"id": r.get("id"), "memory": r.get("memory", ""),
+                          "score": r.get("score", 0)} for r in results]
                 return json.dumps({"results": items, "count": len(items)})
             except Exception as e:
                 self._record_failure()
                 return tool_error(f"Search failed: {e}")
 
-        elif tool_name == "mem0_conclude":
-            conclusion = args.get("conclusion", "")
-            if not conclusion:
-                return tool_error("Missing required parameter: conclusion")
+        elif tool_name == "mem0_add":
+            content = args.get("content", "")
+            if not content:
+                return tool_error("Missing required parameter: content")
             try:
-                client.add(
-                    [{"role": "user", "content": conclusion}],
-                    **self._write_filters(),
+                result = client.add(
+                    [{"role": "user", "content": content}],
+                    user_id=self._user_id, agent_id=self._agent_id,
                     infer=False,
                 )
                 self._record_success()
-                return json.dumps({"result": "Fact stored."})
+                event_id = result.get("event_id") if isinstance(result, dict) else None
+                return json.dumps({"result": "Fact queued for storage.", "event_id": event_id})
             except Exception as e:
                 self._record_failure()
                 return tool_error(f"Failed to store: {e}")
+
+        elif tool_name == "mem0_update":
+            memory_id = args.get("memory_id", "")
+            text = args.get("text", "")
+            if not memory_id:
+                return tool_error("Missing required parameter: memory_id")
+            if not text:
+                return tool_error("Missing required parameter: text")
+            try:
+                client.update(memory_id=memory_id, text=text)
+                self._record_success()
+                return json.dumps({"result": "Memory updated.", "memory_id": memory_id})
+            except Exception as e:
+                err_str = str(e).lower()
+                if "404" in err_str or "not found" in err_str:
+                    return tool_error(f"Memory not found: {memory_id}")
+                self._record_failure()
+                return tool_error(f"Update failed: {e}")
+
+        elif tool_name == "mem0_delete":
+            memory_id = args.get("memory_id", "")
+            if not memory_id:
+                return tool_error("Missing required parameter: memory_id")
+            try:
+                client.delete(memory_id=memory_id)
+                self._record_success()
+                return json.dumps({"result": "Memory deleted.", "memory_id": memory_id})
+            except Exception as e:
+                err_str = str(e).lower()
+                if "404" in err_str or "not found" in err_str:
+                    return tool_error(f"Memory not found: {memory_id}")
+                self._record_failure()
+                return tool_error(f"Delete failed: {e}")
 
         return tool_error(f"Unknown tool: {tool_name}")
 

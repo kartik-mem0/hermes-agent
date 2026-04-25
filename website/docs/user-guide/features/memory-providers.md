@@ -304,7 +304,7 @@ Server-side LLM fact extraction with semantic search, reranking, and automatic d
 | **Data storage** | Mem0 Cloud |
 | **Cost** | Mem0 pricing |
 
-**Tools:** `mem0_profile` (all stored memories), `mem0_search` (semantic search + reranking), `mem0_conclude` (store verbatim facts)
+**Tools (5):** `mem0_list` (list all memories, paginated), `mem0_search` (semantic search), `mem0_add` (store verbatim facts), `mem0_update` (update by ID), `mem0_delete` (delete by ID)
 
 **Setup:**
 ```bash
@@ -528,7 +528,7 @@ echo 'SUPERMEMORY_API_KEY=***' >> ~/.hermes/.env
 |----------|---------|------|-------|-------------|----------------|
 | **Honcho** | Cloud | Paid | 5 | `honcho-ai` | Dialectic user modeling + session-scoped context |
 | **OpenViking** | Self-hosted | Free | 5 | `openviking` + server | Filesystem hierarchy + tiered loading |
-| **Mem0** | Cloud | Paid | 3 | `mem0ai` | Server-side LLM extraction |
+| **Mem0** | Cloud | Paid | 5 | `mem0ai` | Server-side LLM extraction |
 | **Hindsight** | Cloud/Local | Free/Paid | 3 | `hindsight-client` | Knowledge graph + reflect synthesis |
 | **Holographic** | Local | Free | 2 | None | HRR algebra + trust scoring |
 | **RetainDB** | Cloud | $20/mo | 5 | `requests` | Delta compression |

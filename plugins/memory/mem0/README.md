@@ -1,6 +1,6 @@
 # Mem0 Memory Provider
 
-Server-side LLM fact extraction with semantic search, reranking, and automatic deduplication.
+Server-side LLM fact extraction with semantic search and hybrid multi-signal retrieval via the Mem0 Platform v3 API.
 
 ## Requirements
 
@@ -27,12 +27,14 @@ Config file: `$HERMES_HOME/mem0.json`
 |-----|---------|-------------|
 | `user_id` | `hermes-user` | User identifier on Mem0 |
 | `agent_id` | `hermes` | Agent identifier |
-| `rerank` | `true` | Enable reranking for recall |
+| `rerank` | `false` | Enable reranking for precision (adds latency) |
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `mem0_profile` | All stored memories about the user |
-| `mem0_search` | Semantic search with optional reranking |
-| `mem0_conclude` | Store a fact verbatim (no LLM extraction) |
+| `mem0_list` | List all stored memories (paginated) |
+| `mem0_search` | Semantic search by meaning |
+| `mem0_add` | Store a fact verbatim (no LLM extraction) |
+| `mem0_update` | Update a memory's text by ID |
+| `mem0_delete` | Delete a memory by ID |
