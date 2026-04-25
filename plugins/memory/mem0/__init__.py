@@ -1,12 +1,13 @@
 """Mem0 memory plugin — MemoryProvider interface.
 
-Server-side LLM fact extraction, semantic search with reranking, and
-automatic deduplication via the Mem0 Platform API.
+Server-side LLM fact extraction, semantic search, and automatic deduplication
+via the Mem0 Platform API (cloud) or OSS (self-hosted) via Memory.
 
 Original PR #2933 by kartik-mem0, adapted to MemoryProvider ABC.
 
 Config via environment variables:
-  MEM0_API_KEY       — Mem0 Platform API key (required)
+  MEM0_MODE          — Backend mode: "platform" (default) or "oss"
+  MEM0_API_KEY       — Mem0 Platform API key (required for platform mode)
   MEM0_USER_ID       — User identifier (default: hermes-user)
   MEM0_AGENT_ID      — Agent identifier (default: hermes)
 
@@ -15,6 +16,7 @@ Or via $HERMES_HOME/mem0.json.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -60,10 +62,11 @@ def _load_config() -> dict:
     from hermes_constants import get_hermes_home
 
     config = {
+        "mode": os.environ.get("MEM0_MODE", "platform"),
         "api_key": os.environ.get("MEM0_API_KEY", ""),
         "user_id": os.environ.get("MEM0_USER_ID", "hermes-user"),
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
-        "rerank": False,
+        "oss": {},
     }
 
     config_path = get_hermes_home() / "mem0.json"
@@ -107,8 +110,8 @@ SEARCH_SCHEMA = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
-            "rerank": {"type": "boolean", "description": "Enable reranking for precision (default: false, adds latency)."},
             "top_k": {"type": "integer", "description": "Max results (default: 10, max: 50)."},
+            "rerank": {"type": "boolean", "description": "Rerank results for relevance (default: true, platform mode only)."},
         },
         "required": ["query"],
     },
@@ -160,16 +163,18 @@ DELETE_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 class Mem0MemoryProvider(MemoryProvider):
-    """Mem0 Platform memory with server-side extraction and semantic search."""
+    """Mem0 memory with server-side extraction and semantic search.
+
+    Supports Platform API (cloud) and OSS (self-hosted) modes via MEM0_MODE.
+    """
 
     def __init__(self):
         self._config = None
-        self._client = None
-        self._client_lock = threading.Lock()
+        self._backend = None
+        self._mode = "platform"
         self._api_key = ""
         self._user_id = "hermes-user"
         self._agent_id = "hermes"
-        self._rerank = False
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
@@ -184,6 +189,9 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def is_available(self) -> bool:
         cfg = _load_config()
+        mode = cfg.get("mode", "platform")
+        if mode == "oss":
+            return bool(cfg.get("oss", {}).get("vector_store"))
         return bool(cfg.get("api_key"))
 
     def save_config(self, values, hermes_home):
@@ -205,20 +213,24 @@ class Mem0MemoryProvider(MemoryProvider):
             {"key": "api_key", "description": "Mem0 Platform API key", "secret": True, "required": True, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
             {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
             {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
-            {"key": "rerank", "description": "Enable reranking for precision (adds latency)", "default": "false", "choices": ["true", "false"]},
+            {"key": "rerank", "description": "Enable reranking for recall", "default": "true", "choices": ["true", "false"]},
         ]
 
-    def _get_client(self):
-        """Thread-safe client accessor with lazy initialization."""
-        with self._client_lock:
-            if self._client is not None:
-                return self._client
-            try:
-                from mem0 import MemoryClient
-                self._client = MemoryClient(api_key=self._api_key)
-                return self._client
-            except ImportError:
-                raise RuntimeError("mem0 package not installed. Run: pip install mem0ai")
+    def post_setup(self, hermes_home: str, config: dict) -> None:
+        from ._setup import post_setup
+        post_setup(hermes_home, config)
+
+    def _create_backend(self):
+        try:
+            if self._mode == "oss":
+                from ._backend import OSSBackend
+                return OSSBackend(self._config.get("oss", {}))
+            from ._backend import PlatformBackend
+            return PlatformBackend(self._api_key)
+        except Exception as e:
+            logger.error("Mem0 backend failed to initialize (%s mode): %s", self._mode, e)
+            self._init_error = str(e)
+            return None
 
     def _is_breaker_open(self) -> bool:
         """Return True if the circuit breaker is tripped (too many failures)."""
@@ -230,6 +242,15 @@ class Mem0MemoryProvider(MemoryProvider):
             return False
         return True
 
+    def _format_error(self, prefix: str, exc: Exception) -> str:
+        msg = f"{prefix}: {exc}"
+        if self._mode == "oss":
+            err_str = str(exc).lower()
+            if "connection" in err_str or "refused" in err_str or "timeout" in err_str:
+                vs = self._config.get("oss", {}).get("vector_store", {})
+                msg += f" (check that {vs.get('provider', 'vector store')} is running)"
+        return msg
+
     def _record_success(self):
         self._consecutive_failures = 0
 
@@ -237,43 +258,40 @@ class Mem0MemoryProvider(MemoryProvider):
         self._consecutive_failures += 1
         if self._consecutive_failures >= _BREAKER_THRESHOLD:
             self._breaker_open_until = time.monotonic() + _BREAKER_COOLDOWN_SECS
+            hint = ""
+            if self._mode == "oss":
+                vs = self._config.get("oss", {}).get("vector_store", {})
+                provider = vs.get("provider", "unknown")
+                hint = f" Check that your {provider} vector store is running and reachable."
             logger.warning(
                 "Mem0 circuit breaker tripped after %d consecutive failures. "
-                "Pausing API calls for %ds.",
-                self._consecutive_failures, _BREAKER_COOLDOWN_SECS,
+                "Pausing API calls for %ds.%s",
+                self._consecutive_failures, _BREAKER_COOLDOWN_SECS, hint,
             )
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._config = _load_config()
+        self._mode = self._config.get("mode", "platform")
         self._api_key = self._config.get("api_key", "")
         self._user_id = kwargs.get("user_id") or self._config.get("user_id", "hermes-user")
         self._agent_id = self._config.get("agent_id", "hermes")
-        self._rerank = self._config.get("rerank", False)
-        capture_event("hermes.plugin.registered", api_key=self._api_key)
+        self._backend = self._create_backend()
+        if self._backend and hasattr(self._backend, "close"):
+            atexit.register(self._shutdown_backend)
+        capture_event("hermes.plugin.registered", {"mode": self._mode}, api_key=self._api_key, mode=self._mode)
 
     def _read_filters(self) -> Dict[str, Any]:
         """Filters for search/get_all — scoped to user only for cross-session recall."""
         return {"user_id": self._user_id}
 
-    def _write_filters(self) -> Dict[str, Any]:
-        """Filters for add — scoped to user + agent for attribution."""
-        return {"user_id": self._user_id, "agent_id": self._agent_id}
-
-    @staticmethod
-    def _unwrap_results(response: Any) -> list:
-        """Normalize Mem0 API response — v2 wraps results in {"results": [...]}."""
-        if isinstance(response, dict):
-            return response.get("results", [])
-        if isinstance(response, list):
-            return response
-        return []
-
     def system_prompt_block(self) -> str:
+        mode_label = "platform (cloud API)" if self._mode == "platform" else "OSS (self-hosted)"
+        rerank_note = " Rerank is available on search." if self._mode == "platform" else ""
         return (
             "# Mem0 Memory\n"
-            f"Active. User: {self._user_id}.\n"
+            f"Active. Mode: {mode_label}. User: {self._user_id}.\n"
             "Use mem0_search to find memories, mem0_add to store facts, "
-            "mem0_list for a full overview, mem0_update and mem0_delete to manage by ID."
+            f"mem0_list for a full overview, mem0_update and mem0_delete to manage by ID.{rerank_note}"
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -287,19 +305,13 @@ class Mem0MemoryProvider(MemoryProvider):
         return f"## Mem0 Memory\n{result}"
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        if self._is_breaker_open():
+        if self._backend is None or self._is_breaker_open():
             return
 
         def _run():
             start = time.monotonic()
             try:
-                client = self._get_client()
-                results = self._unwrap_results(client.search(
-                    query=query,
-                    filters=self._read_filters(),
-                    rerank=self._rerank,
-                    top_k=5,
-                ))
+                results = self._backend.search(query=query, filters=self._read_filters(), top_k=5, rerank=True)
                 if results:
                     lines = [r.get("memory", "") for r in results if r.get("memory")]
                     with self._prefetch_lock:
@@ -308,7 +320,7 @@ class Mem0MemoryProvider(MemoryProvider):
                 latency = (time.monotonic() - start) * 1000
                 capture_event("hermes.hook.recall", {
                     "memory_count": len(results), "latency_ms": latency,
-                }, api_key=self._api_key)
+                }, api_key=self._api_key, mode=self._mode)
             except Exception as e:
                 self._record_failure()
                 logger.debug("Mem0 prefetch failed: %s", e)
@@ -318,23 +330,22 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
-        if self._is_breaker_open():
+        if self._backend is None or self._is_breaker_open():
             return
 
         def _sync():
             start = time.monotonic()
             try:
-                client = self._get_client()
                 messages = [
                     {"role": "user", "content": user_content},
                     {"role": "assistant", "content": assistant_content},
                 ]
-                client.add(messages, user_id=self._user_id, agent_id=self._agent_id)
+                self._backend.add(messages, user_id=self._user_id, agent_id=self._agent_id, infer=True)
                 self._record_success()
                 latency = (time.monotonic() - start) * 1000
                 capture_event("hermes.hook.capture", {
                     "latency_ms": latency,
-                }, api_key=self._api_key)
+                }, api_key=self._api_key, mode=self._mode)
             except Exception as e:
                 self._record_failure()
                 logger.warning("Mem0 sync failed: %s", e)
@@ -350,61 +361,64 @@ class Mem0MemoryProvider(MemoryProvider):
         return [LIST_SCHEMA, SEARCH_SCHEMA, ADD_SCHEMA, UPDATE_SCHEMA, DELETE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
-        if self._is_breaker_open():
-            return json.dumps({
-                "error": "Mem0 API temporarily unavailable (multiple consecutive failures). Will retry automatically."
-            })
+        if self._backend is None:
+            err = getattr(self, "_init_error", "unknown error")
+            hint = ""
+            if self._mode == "oss":
+                vs = self._config.get("oss", {}).get("vector_store", {})
+                provider = vs.get("provider", "vector store")
+                hint = f" Check that {provider} is running and reachable."
+            return json.dumps({"error": f"Mem0 backend not initialized: {err}.{hint}"})
 
-        try:
-            client = self._get_client()
-        except Exception as e:
-            return tool_error(str(e))
+        if self._is_breaker_open():
+            msg = "Mem0 temporarily unavailable (multiple consecutive failures). Will retry automatically."
+            if self._mode == "oss":
+                vs = self._config.get("oss", {}).get("vector_store", {})
+                msg += f" Check that your {vs.get('provider', 'vector store')} is running."
+            return json.dumps({"error": msg})
 
         if tool_name == "mem0_list":
             page = int(args.get("page", 1))
             page_size = min(int(args.get("page_size", 100)), 200)
             start = time.monotonic()
             try:
-                response = client.get_all(
+                response = self._backend.get_all(
                     filters=self._read_filters(), page=page, page_size=page_size,
                 )
                 self._record_success()
-                results = response.get("results", []) if isinstance(response, dict) else response
+                results = response.get("results", [])
                 latency = (time.monotonic() - start) * 1000
                 capture_tool_event("memory_list", success=True, latency_ms=latency,
-                                   result_count=len(results), api_key=self._api_key)
+                                   result_count=len(results), api_key=self._api_key, mode=self._mode)
                 if not results:
                     return json.dumps({"result": "No memories stored yet."})
                 items = [{"id": m.get("id"), "memory": m.get("memory", "")}
                          for m in results]
                 return json.dumps({
                     "results": items,
-                    "count": response.get("count", len(items)) if isinstance(response, dict) else len(items),
+                    "count": response.get("count", len(items)),
                     "page": page, "page_size": page_size,
                 })
             except Exception as e:
                 latency = (time.monotonic() - start) * 1000
                 capture_tool_event("memory_list", success=False, latency_ms=latency,
-                                   api_key=self._api_key)
+                                   api_key=self._api_key, mode=self._mode)
                 self._record_failure()
-                return tool_error(f"Failed to list memories: {e}")
+                return tool_error(self._format_error("Failed to list memories", e))
 
         elif tool_name == "mem0_search":
             query = args.get("query", "")
             if not query:
                 return tool_error("Missing required parameter: query")
-            rerank = args.get("rerank", self._rerank)
             top_k = min(int(args.get("top_k", 10)), 50)
+            rerank = bool(args.get("rerank", True))
             start = time.monotonic()
             try:
-                response = client.search(
-                    query, filters=self._read_filters(), rerank=rerank, top_k=top_k,
-                )
+                results = self._backend.search(query, filters=self._read_filters(), top_k=top_k, rerank=rerank)
                 self._record_success()
-                results = self._unwrap_results(response)
                 latency = (time.monotonic() - start) * 1000
                 capture_tool_event("memory_search", success=True, latency_ms=latency,
-                                   result_count=len(results), api_key=self._api_key)
+                                   result_count=len(results), api_key=self._api_key, mode=self._mode)
                 if not results:
                     return json.dumps({"result": "No relevant memories found."})
                 items = [{"id": r.get("id"), "memory": r.get("memory", ""),
@@ -413,9 +427,9 @@ class Mem0MemoryProvider(MemoryProvider):
             except Exception as e:
                 latency = (time.monotonic() - start) * 1000
                 capture_tool_event("memory_search", success=False, latency_ms=latency,
-                                   api_key=self._api_key)
+                                   api_key=self._api_key, mode=self._mode)
                 self._record_failure()
-                return tool_error(f"Search failed: {e}")
+                return tool_error(self._format_error("Search failed", e))
 
         elif tool_name == "mem0_add":
             content = args.get("content", "")
@@ -423,7 +437,7 @@ class Mem0MemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: content")
             start = time.monotonic()
             try:
-                result = client.add(
+                result = self._backend.add(
                     [{"role": "user", "content": content}],
                     user_id=self._user_id, agent_id=self._agent_id,
                     infer=False,
@@ -432,15 +446,15 @@ class Mem0MemoryProvider(MemoryProvider):
                 latency = (time.monotonic() - start) * 1000
                 fact_count = len(result.get("results", [])) if isinstance(result, dict) else 0
                 capture_tool_event("memory_add", success=True, latency_ms=latency,
-                                   fact_count=fact_count, api_key=self._api_key)
+                                   fact_count=fact_count, api_key=self._api_key, mode=self._mode)
                 event_id = result.get("event_id") if isinstance(result, dict) else None
                 return json.dumps({"result": "Fact queued for storage.", "event_id": event_id})
             except Exception as e:
                 latency = (time.monotonic() - start) * 1000
                 capture_tool_event("memory_add", success=False, latency_ms=latency,
-                                   api_key=self._api_key)
+                                   api_key=self._api_key, mode=self._mode)
                 self._record_failure()
-                return tool_error(f"Failed to store: {e}")
+                return tool_error(self._format_error("Failed to store", e))
 
         elif tool_name == "mem0_update":
             memory_id = args.get("memory_id", "")
@@ -451,20 +465,20 @@ class Mem0MemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: text")
             start = time.monotonic()
             try:
-                client.update(memory_id=memory_id, text=text)
+                result = self._backend.update(memory_id, text)
                 self._record_success()
                 latency = (time.monotonic() - start) * 1000
                 capture_tool_event("memory_update", success=True, latency_ms=latency,
-                                   api_key=self._api_key)
-                return json.dumps({"result": "Memory updated.", "memory_id": memory_id})
+                                   api_key=self._api_key, mode=self._mode)
+                return json.dumps(result)
             except Exception as e:
                 latency = (time.monotonic() - start) * 1000
                 capture_tool_event("memory_update", success=False, latency_ms=latency,
-                                   api_key=self._api_key)
+                                   api_key=self._api_key, mode=self._mode)
                 if _is_client_error(e):
                     return tool_error(f"Memory not found: {memory_id}")
                 self._record_failure()
-                return tool_error(f"Update failed: {e}")
+                return tool_error(self._format_error("Update failed", e))
 
         elif tool_name == "mem0_delete":
             memory_id = args.get("memory_id", "")
@@ -472,29 +486,36 @@ class Mem0MemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: memory_id")
             start = time.monotonic()
             try:
-                client.delete(memory_id=memory_id)
+                result = self._backend.delete(memory_id)
                 self._record_success()
                 latency = (time.monotonic() - start) * 1000
                 capture_tool_event("memory_delete", success=True, latency_ms=latency,
-                                   delete_mode="single", api_key=self._api_key)
-                return json.dumps({"result": "Memory deleted.", "memory_id": memory_id})
+                                   delete_mode="single", api_key=self._api_key, mode=self._mode)
+                return json.dumps(result)
             except Exception as e:
                 latency = (time.monotonic() - start) * 1000
                 capture_tool_event("memory_delete", success=False, latency_ms=latency,
-                                   api_key=self._api_key)
+                                   api_key=self._api_key, mode=self._mode)
                 if _is_client_error(e):
                     return tool_error(f"Memory not found: {memory_id}")
                 self._record_failure()
-                return tool_error(f"Delete failed: {e}")
+                return tool_error(self._format_error("Delete failed", e))
 
         return tool_error(f"Unknown tool: {tool_name}")
+
+    def _shutdown_backend(self):
+        try:
+            if self._backend and hasattr(self._backend, "close"):
+                self._backend.close()
+                self._backend = None
+        except Exception:
+            pass
 
     def shutdown(self) -> None:
         for t in (self._prefetch_thread, self._sync_thread):
             if t and t.is_alive():
                 t.join(timeout=5.0)
-        with self._client_lock:
-            self._client = None
+        self._shutdown_backend()
 
 
 def register(ctx) -> None:

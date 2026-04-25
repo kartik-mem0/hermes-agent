@@ -120,6 +120,7 @@ def capture_event(
     event_name: str,
     properties: Optional[Dict[str, Any]] = None,
     api_key: str = "",
+    mode: str = "",
 ) -> None:
     if not _is_telemetry_enabled():
         return
@@ -149,6 +150,7 @@ def capture_event(
                 "sample_rate": 1.0 if is_lifecycle else sample_rate,
                 "$process_person_profile": False,
                 "$lib": "posthog-python",
+                **({"mode": mode} if mode else {}),
                 **(properties or {}),
             },
         }
@@ -173,10 +175,12 @@ def capture_tool_event(
     success: bool,
     latency_ms: float,
     api_key: str = "",
+    mode: str = "",
     **extra: Any,
 ) -> None:
     capture_event(
         f"hermes.tool.{tool_name}",
         {"tool_name": tool_name, "success": success, "latency_ms": latency_ms, **extra},
         api_key=api_key,
+        mode=mode,
     )
