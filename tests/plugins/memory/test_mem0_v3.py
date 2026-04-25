@@ -216,6 +216,35 @@ class TestMem0ErrorHandling:
         assert "error" in result
         assert provider._consecutive_failures == 0
 
+    def test_update_validation_error_no_circuit_breaker(self, monkeypatch):
+        """ValidationError (bad UUID format) should not trip circuit breaker."""
+        class ValidationError(Exception):
+            pass
+        client = FakeClientV3()
+        client.update = lambda **kw: (_ for _ in ()).throw(
+            ValidationError('{"error":"memory_id should be a valid UUID"}')
+        )
+        provider = self._make_provider(monkeypatch, client)
+        result = json.loads(provider.handle_tool_call(
+            "mem0_update", {"memory_id": "not-a-uuid", "text": "x"}
+        ))
+        assert "error" in result
+        assert provider._consecutive_failures == 0
+
+    def test_delete_validation_error_no_circuit_breaker(self, monkeypatch):
+        class ValidationError(Exception):
+            pass
+        client = FakeClientV3()
+        client.delete = lambda **kw: (_ for _ in ()).throw(
+            ValidationError('{"error":"memory_id should be a valid UUID"}')
+        )
+        provider = self._make_provider(monkeypatch, client)
+        result = json.loads(provider.handle_tool_call(
+            "mem0_delete", {"memory_id": "not-a-uuid"}
+        ))
+        assert "error" in result
+        assert provider._consecutive_failures == 0
+
     def test_update_5xx_trips_circuit_breaker(self, monkeypatch):
         client = FakeClientV3()
         client.update = lambda **kw: (_ for _ in ()).throw(Exception("500 Internal Server Error"))

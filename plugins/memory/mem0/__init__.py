@@ -32,6 +32,17 @@ logger = logging.getLogger(__name__)
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
 
+_CLIENT_ERROR_TYPES = ("MemoryNotFoundError", "ValidationError")
+
+
+def _is_client_error(exc: Exception) -> bool:
+    """True for user-caused errors (bad ID, not found) that should NOT trip circuit breaker."""
+    etype = type(exc).__name__
+    if etype in _CLIENT_ERROR_TYPES:
+        return True
+    err_str = str(exc).lower()
+    return "404" in err_str or "not found" in err_str or "valid uuid" in err_str
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -410,8 +421,7 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_success()
                 return json.dumps({"result": "Memory updated.", "memory_id": memory_id})
             except Exception as e:
-                err_str = str(e).lower()
-                if "404" in err_str or "not found" in err_str:
+                if _is_client_error(e):
                     return tool_error(f"Memory not found: {memory_id}")
                 self._record_failure()
                 return tool_error(f"Update failed: {e}")
@@ -425,8 +435,7 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_success()
                 return json.dumps({"result": "Memory deleted.", "memory_id": memory_id})
             except Exception as e:
-                err_str = str(e).lower()
-                if "404" in err_str or "not found" in err_str:
+                if _is_client_error(e):
                     return tool_error(f"Memory not found: {memory_id}")
                 self._record_failure()
                 return tool_error(f"Delete failed: {e}")
