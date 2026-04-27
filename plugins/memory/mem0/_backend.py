@@ -73,8 +73,23 @@ class OSSBackend(Mem0Backend):
 
     def __init__(self, oss_config: dict):
         from mem0 import Memory
+
+        vector_store = dict(oss_config["vector_store"])
+        vs_config = dict(vector_store.get("config", {}))
+
+        embedder_config = oss_config.get("embedder", {}).get("config", {})
+        dims = embedder_config.get("embedding_dims")
+        if not dims:
+            from ._oss_providers import KNOWN_DIMS
+            model = embedder_config.get("model", "")
+            dims = KNOWN_DIMS.get(model)
+        if dims and "embedding_model_dims" not in vs_config:
+            vs_config["embedding_model_dims"] = dims
+
+        vector_store["config"] = vs_config
+
         config = {
-            "vector_store": oss_config["vector_store"],
+            "vector_store": vector_store,
             "llm": oss_config["llm"],
             "embedder": oss_config["embedder"],
             "version": "v1.1",

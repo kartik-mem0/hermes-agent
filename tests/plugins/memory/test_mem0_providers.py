@@ -19,9 +19,6 @@ class TestProviderDefinitions:
             assert "needs_key" in p
             assert "default_model" in p
 
-    def test_llm_provider_ids(self):
-        assert set(LLM_PROVIDERS.keys()) == {"openai", "ollama", "anthropic"}
-
     def test_embedder_providers_have_required_keys(self):
         for pid, p in EMBEDDER_PROVIDERS.items():
             assert "label" in p

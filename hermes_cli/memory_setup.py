@@ -86,14 +86,23 @@ def _install_dependencies(provider_name: str) -> None:
         "hindsight-all": "hindsight",
     }
 
-    # Check which packages are missing
+    # Check which packages are missing or need upgrading
     missing = []
     for dep in pip_deps:
         import_name = _IMPORT_NAMES.get(dep, dep.replace("-", "_").split("[")[0])
         try:
-            __import__(import_name)
+            mod = __import__(import_name)
+            installed_ver = getattr(mod, "__version__", None)
+            if installed_ver and ">=" in dep:
+                req_ver = dep.split(">=")[1].split(",")[0].strip()
+                installed_parts = tuple(int(x) for x in installed_ver.split(".")[:3])
+                required_parts = tuple(int(x) for x in req_ver.split(".")[:3])
+                if installed_parts < required_parts:
+                    missing.append(dep)
         except ImportError:
             missing.append(dep)
+        except Exception:
+            pass
 
     if not missing:
         return
