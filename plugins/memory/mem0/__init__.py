@@ -448,7 +448,8 @@ class Mem0MemoryProvider(MemoryProvider):
                 capture_tool_event("memory_add", success=True, latency_ms=latency,
                                    fact_count=fact_count, api_key=self._api_key, mode=self._mode)
                 event_id = result.get("event_id") if isinstance(result, dict) else None
-                return json.dumps({"result": "Fact queued for storage.", "event_id": event_id})
+                msg = "Fact stored." if self._mode == "oss" else "Fact queued for storage."
+                return json.dumps({"result": msg, "event_id": event_id})
             except Exception as e:
                 latency = (time.monotonic() - start) * 1000
                 capture_tool_event("memory_add", success=False, latency_ms=latency,
