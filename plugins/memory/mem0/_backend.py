@@ -72,10 +72,14 @@ class OSSBackend(Mem0Backend):
     """Wraps mem0.Memory for self-hosted (OSS) mode."""
 
     def __init__(self, oss_config: dict):
+        import os
         from mem0 import Memory
 
         vector_store = dict(oss_config["vector_store"])
         vs_config = dict(vector_store.get("config", {}))
+
+        if "path" in vs_config:
+            vs_config["path"] = os.path.expanduser(vs_config["path"])
 
         embedder_config = oss_config.get("embedder", {}).get("config", {})
         dims = embedder_config.get("embedding_dims")
@@ -83,8 +87,11 @@ class OSSBackend(Mem0Backend):
             from ._oss_providers import KNOWN_DIMS
             model = embedder_config.get("model", "")
             dims = KNOWN_DIMS.get(model)
-        if dims and "embedding_model_dims" not in vs_config:
+        if dims:
             vs_config["embedding_model_dims"] = dims
+            self._recreate_collection_if_dims_changed(
+                vector_store.get("provider", "qdrant"), vs_config, dims,
+            )
 
         vector_store["config"] = vs_config
 
@@ -95,6 +102,56 @@ class OSSBackend(Mem0Backend):
             "version": "v1.1",
         }
         self._memory = Memory.from_config(config)
+
+    @staticmethod
+    def _recreate_collection_if_dims_changed(provider: str, vs_config: dict, expected_dims: int) -> None:
+        """Delete stale vector collection when embedding dimensions change."""
+        collection_name = vs_config.get("collection_name", "mem0")
+        if provider == "qdrant":
+            try:
+                from qdrant_client import QdrantClient
+                path = vs_config.get("path")
+                url = vs_config.get("url")
+                if path:
+                    client = QdrantClient(path=path)
+                elif url:
+                    client = QdrantClient(url=url, api_key=vs_config.get("api_key"))
+                else:
+                    return
+                if not client.collection_exists(collection_name):
+                    client.close()
+                    return
+                info = client.get_collection(collection_name)
+                current_dims = info.config.params.vectors.size
+                if current_dims != expected_dims:
+                    client.delete_collection(collection_name)
+                client.close()
+            except Exception:
+                pass
+        elif provider == "pgvector":
+            try:
+                import psycopg2
+                conn_params = {}
+                for k in ("host", "port", "user", "password", "dbname"):
+                    if vs_config.get(k):
+                        conn_params[k] = vs_config[k]
+                if vs_config.get("sslmode"):
+                    conn_params["sslmode"] = vs_config["sslmode"]
+                conn = psycopg2.connect(**conn_params)
+                conn.autocommit = True
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT atttypmod FROM pg_attribute "
+                    "WHERE attrelid = %s::regclass AND attname = 'vector'",
+                    (collection_name,),
+                )
+                row = cur.fetchone()
+                if row and row[0] > 0 and row[0] != expected_dims:
+                    cur.execute(f"DROP TABLE IF EXISTS {collection_name}")
+                cur.close()
+                conn.close()
+            except Exception:
+                pass
 
     def search(self, query: str, *, filters: dict, top_k: int = 10, rerank: bool = True) -> list[dict]:
         response = self._memory.search(query, filters=filters, top_k=top_k)
