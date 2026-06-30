@@ -149,8 +149,11 @@ SEARCH_SCHEMA = {
 ADD_SCHEMA = {
     "name": "mem0_add",
     "description": (
-        "Store a durable fact about the user. Stored verbatim (no LLM extraction). "
-        "Use for explicit preferences, corrections, or decisions."
+        "Store a durable fact about the user, verbatim (no LLM extraction). "
+        "Call this the moment the user states a lasting preference, correction, "
+        "decision, or personal detail worth recalling on future turns — don't "
+        "wait to be asked to remember. Skip transient chit-chat and facts you've "
+        "already stored."
     ),
     "parameters": {
         "type": "object",
@@ -163,7 +166,11 @@ ADD_SCHEMA = {
 
 UPDATE_SCHEMA = {
     "name": "mem0_update",
-    "description": "Update an existing memory's text by its ID.",
+    "description": (
+        "Replace the text of an existing memory by its ID (take the ID from a "
+        "mem0_search or mem0_list result). Use when a stored fact has changed "
+        "or was wrong — correct it in place instead of adding a duplicate."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -176,7 +183,11 @@ UPDATE_SCHEMA = {
 
 DELETE_SCHEMA = {
     "name": "mem0_delete",
-    "description": "Delete a memory by its ID.",
+    "description": (
+        "Delete a memory by its ID (take the ID from a mem0_search or mem0_list "
+        "result). Use when a stored fact is obsolete or the user asks you to "
+        "forget it; prefer mem0_update if the fact merely changed."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
