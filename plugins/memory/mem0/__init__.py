@@ -121,8 +121,7 @@ SEARCH_SCHEMA = {
         "what you know about the user (preferences, facts, history, people, "
         "projects, past decisions). For multi-part or multi-hop questions, "
         "call it MULTIPLE times — vary the wording and run follow-up searches "
-        "on what earlier results reveal; one search is rarely enough. Set "
-        "rerank=true for higher accuracy on important queries."
+        "on what earlier results reveal; one search is rarely enough."
     ),
     "parameters": {
         "type": "object",
