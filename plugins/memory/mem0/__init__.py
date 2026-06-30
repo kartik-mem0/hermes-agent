@@ -109,8 +109,10 @@ def _load_config() -> dict:
 LIST_SCHEMA = {
     "name": "mem0_list",
     "description": (
-        "List all stored memories about the user. "
-        "Use at conversation start for full overview."
+        "List ALL stored memories about the user, unranked and paginated. "
+        "Use for a full overview/audit at conversation start, or to browse "
+        "everything when you don't have a specific query. For answering a "
+        "specific question, prefer mem0_search."
     ),
     "parameters": {
         "type": "object",
@@ -125,7 +127,13 @@ LIST_SCHEMA = {
 SEARCH_SCHEMA = {
     "name": "mem0_search",
     "description": (
-        "Search memories by meaning. Returns relevant facts ranked by relevance."
+        "Search the user's memories by meaning; returns facts ranked by "
+        "relevance. Use this BEFORE answering any question that may depend on "
+        "what you know about the user (preferences, facts, history, people, "
+        "projects, past decisions). For multi-part or multi-hop questions, "
+        "call it MULTIPLE times — vary the wording and run follow-up searches "
+        "on what earlier results reveal; one search is rarely enough. Set "
+        "rerank=true for higher accuracy on important queries."
     ),
     "parameters": {
         "type": "object",
@@ -197,9 +205,6 @@ class Mem0MemoryProvider(MemoryProvider):
         self._user_id = _DEFAULT_USER_ID
         self._agent_id = "hermes"
         self._channel = "cli"  # gateway channel name (cli/telegram/discord/...)
-        self._prefetch_result = ""
-        self._prefetch_lock = threading.Lock()
-        self._prefetch_thread = None
         self._sync_thread = None
         # Circuit breaker state
         self._consecutive_failures = 0
@@ -361,44 +366,45 @@ class Mem0MemoryProvider(MemoryProvider):
         return (
             "# Mem0 Memory\n"
             f"Active. Mode: {mode_label}. User: {self._user_id}.\n"
-            "Use mem0_search to find memories, mem0_add to store facts, "
+            "You have persistent memory of this user from past conversations. "
+            "ALWAYS call mem0_search before answering anything that could depend "
+            "on prior context (the user's preferences, facts, history, people, "
+            "projects, or earlier decisions) — do not rely on the chat window "
+            "alone, and do not assume you have no memory.\n"
+            "For multi-part or multi-hop questions, run SEVERAL searches with "
+            "different wording/angles and follow-up searches on what the first "
+            "results surface; one search is rarely enough. Keep searching until "
+            "you have every fact the question needs before you answer.\n"
+            "Tools: mem0_search to find memories, mem0_add to store facts, "
             f"mem0_list for a full overview, mem0_update and mem0_delete to manage by ID.{rerank_note}"
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(timeout=3.0)
-        # If the thread still hasn't finished, leave the result for the next call.
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
+        """Recall memories relevant to the CURRENT question, synchronously.
+
+        Searches the backend with ``query`` so the auto-injected context
+        matches what the user is asking right now — not a stale warm from the
+        previous turn. Best-effort: gated by the circuit breaker, errors are
+        swallowed, and the backend's own search timeout bounds latency so a
+        slow recall can never block the turn. queue_prefetch is therefore a
+        no-op (ABC default).
+        """
+        if not query or self._backend is None or self._is_breaker_open():
             return ""
-        with self._prefetch_lock:
-            result = self._prefetch_result
-            self._prefetch_result = ""
-        if not result:
+        try:
+            results = self._backend.search(
+                query, filters=self._read_filters(), top_k=10, rerank=True,
+            )
+            self._record_success()
+        except Exception as e:
+            self._record_failure()
+            logger.debug("Mem0 prefetch failed: %s", e)
             return ""
-        return f"## Mem0 Memory\n{result}"
-
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        if self._backend is None or self._is_breaker_open():
-            return
-
-        def _run():
-            backend = self._backend
-            if backend is None:
-                return
-            try:
-                results = backend.search(query=query, filters=self._read_filters(), top_k=5, rerank=True)
-                if results:
-                    lines = [r.get("memory", "") for r in results if r.get("memory")]
-                    with self._prefetch_lock:
-                        self._prefetch_result = "\n".join(f"- {l}" for l in lines)
-                self._record_success()
-            except Exception as e:
-                self._record_failure()
-                logger.debug("Mem0 prefetch failed: %s", e)
-
-        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="mem0-prefetch")
-        self._prefetch_thread.start()
+        lines = [r.get("memory", "") for r in (results or []) if r.get("memory")]
+        if not lines:
+            return ""
+        body = "\n".join(f"- {l}" for l in lines)
+        return f"## Mem0 Memory\n{body}"
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
@@ -563,9 +569,8 @@ class Mem0MemoryProvider(MemoryProvider):
             pass
 
     def shutdown(self) -> None:
-        for t in (self._prefetch_thread, self._sync_thread):
-            if t and t.is_alive():
-                t.join(timeout=5.0)
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=5.0)
         self._shutdown_backend()
 
 
