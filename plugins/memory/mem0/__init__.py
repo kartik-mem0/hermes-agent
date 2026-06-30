@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # for _BREAKER_COOLDOWN_SECS to avoid hammering a down server.
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
-_PREFETCH_WAIT_SECS = 1.5
+_PREFETCH_WAIT_SECS = 3.0
 
 _CLIENT_ERROR_TYPES = ("MemoryNotFoundError", "ValidationError")
 
