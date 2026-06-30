@@ -306,13 +306,16 @@ class TestSelfHostedBackend:
     def test_get_all_slices_requested_page(self):
         s = _StubServer(rows=10)
         out = _backend(s).get_all(filters={"user_id": "u1"}, page=2, page_size=3)
-        # top_k = page*page_size = 6 -> server returns m0..m5 -> slice[3:6]
+        # We over-fetch (top_k=_MAX_TOP_K) and slice the page locally...
         assert [r["id"] for r in out["results"]] == ["m3", "m4", "m5"]
-        assert out["count"] == 6
+        # ...so count is the TRUE total, not the page size (issue #52921).
+        assert out["count"] == 10
 
-    def test_get_all_caps_top_k_at_server_limit(self):
+    def test_get_all_requests_max_top_k_for_accurate_count(self):
+        # Always request _MAX_TOP_K (not page*page_size) so `count` reflects the
+        # real total — self-hosted GET /memories returns no count field (#52921).
         s = _StubServer(rows=10)
-        _backend(s).get_all(filters={"user_id": "u1"}, page=100, page_size=200)
+        _backend(s).get_all(filters={"user_id": "u1"}, page=1, page_size=3)
         req = s.requests[-1]
         assert int(req.url.params["top_k"]) == SelfHostedBackend._MAX_TOP_K
 

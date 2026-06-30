@@ -101,7 +101,7 @@ class SelfHostedBackend(Mem0Backend):
     ``/search`` routes.
     """
     
-    _MAX_TOP_K = 1000
+    _MAX_TOP_K = 10000
 
     def __init__(self, api_key: str, host: str):
         import httpx
@@ -127,7 +127,7 @@ class SelfHostedBackend(Mem0Backend):
 
     def get_all(self, *, filters: dict, page: int = 1, page_size: int = 100) -> dict:
         params: dict[str, Any] = {k: v for k, v in (filters or {}).items() if v}
-        params["top_k"] = min(page * page_size, self._MAX_TOP_K)
+        params["top_k"] = self._MAX_TOP_K
         all_results = _unwrap_results(self._json("GET", "/memories", params=params))
         total = len(all_results)
         start = (page - 1) * page_size
