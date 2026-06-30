@@ -117,10 +117,10 @@ SEARCH_SCHEMA = {
     "name": "mem0_search",
     "description": (
         "Search the user's memories by meaning; returns facts ranked by "
-        "relevance. Use this BEFORE answering any question that may depend on "
+        "relevance. Use this before answering any question that may depend on "
         "what you know about the user (preferences, facts, history, people, "
         "projects, past decisions). For multi-part or multi-hop questions, "
-        "call it MULTIPLE times — vary the wording and run follow-up searches "
+        "call it several times — vary the wording and run follow-up searches "
         "on what earlier results reveal; one search is rarely enough."
     ),
     "parameters": {
@@ -389,7 +389,7 @@ class Mem0MemoryProvider(MemoryProvider):
             "on prior context (the user's preferences, facts, history, people, "
             "projects, or earlier decisions) — do not rely on the chat window "
             "alone, and do not assume you have no memory.\n"
-            "For multi-part or multi-hop questions, run SEVERAL searches with "
+            "For multi-part or multi-hop questions, run several searches with "
             "different wording/angles and follow-up searches on what the first "
             "results surface; one search is rarely enough. Keep searching until "
             "you have every fact the question needs before you answer.\n"
